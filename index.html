@@ -42,8 +42,8 @@ body{background:  radial-gradient(ellipse 700px 500px at 15% 20%, rgba(120,80,16
 
 /* ── Layout ── */
 .app{display:grid;grid-template-columns:360px 1fr;min-height:100vh;}
-.sidebar{padding:24px 20px;border-right:1px solid var(--bdr);overflow-y:auto;background:rgba(23,23,21,0.88);backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);position:sticky;top:0;height:100vh;}
-.main{padding:24px 28px;overflow-y:auto;background:rgba(14,14,12,0.55);}
+.sidebar{padding:calc(24px + env(safe-area-inset-top,0px)) calc(20px + env(safe-area-inset-right,0px)) 24px calc(20px + env(safe-area-inset-left,0px));border-right:1px solid var(--bdr);overflow-y:auto;background:rgba(23,23,21,0.88);backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);position:sticky;top:0;height:100vh;}
+.main{padding:24px calc(28px + env(safe-area-inset-right,0px)) calc(24px + env(safe-area-inset-bottom,0px)) calc(28px + env(safe-area-inset-left,0px));overflow-y:auto;background:rgba(14,14,12,0.55);}
 
 /* ── Header ── */
 .brand{margin-bottom:28px;padding-bottom:20px;border-bottom:1px solid var(--bdr);}
@@ -583,7 +583,7 @@ function getAttackEffArm(baseArm, aType, blessed, bdActive) {
   if (tgt.battleDriven && bdActive)                                               arm += 2;
   return arm;
 }
-function hitProbs(stat, def, dice, reroll, drop) {
+function hitProbs(stat, def, dice, reroll, drop, stolenFate = false) {
   const need = def - stat;
   const n = Math.max(1, Math.min(5, dice));
   const { dist: sd, critDist: cbd, total: tot } = getDropPrecomp(n, drop);
@@ -600,6 +600,10 @@ function hitProbs(stat, def, dice, reroll, drop) {
   if (n * 6 < need) critHits += allSixesCount(n, drop); // boxcars: all-6s forced crit (n>=2)
   let hp    = Math.max(0, Math.min(1, (normalHits + critHits) / tot));
   let critP = Math.max(0, Math.min(hp, critHits / tot));
+  // Stolen Fate: extra parallel die; on a hit, also crits if it matches a kept attack
+  // die. A non-crit (no-pair) kept pool has n distinct values -> P(match)=n/6. Applied
+  // to the single roll, before any miss-reroll (the SF die re-rolls in parallel).
+  if (stolenFate) { critP = critP + (n / 6) * (hp - critP); critP = Math.min(hp, critP); }
   if (reroll) {
     critP = critP * (2 - hp);
     hp    = 1 - (1 - hp) * (1 - hp);
@@ -608,14 +612,14 @@ function hitProbs(stat, def, dice, reroll, drop) {
   return { hp, critP };
 }
 
-function hitProbsInSet(stat, baseDef, dice, reroll, drop, aType, set) {
+function hitProbsInSet(stat, baseDef, dice, reroll, drop, aType, set, stolenFate = false) {
   const autoHit =
     (set.includes('knockdown') || set.includes('stationary')) && aType === 'melee';
   if (autoHit) {
     // Auto-hit (KD/Stationary + melee): no dice rolled, so no crits possible
     return { hp: 1.0, critP: 0 };
   }
-  return hitProbs(stat, effDef(baseDef, set), dice, reroll, drop);
+  return hitProbs(stat, effDef(baseDef, set), dice, reroll, drop, stolenFate);
 }
 
 // ── Damage distribution ───────────────────────────────────────────────────────
@@ -977,13 +981,26 @@ function computePKill(attackData, hp, tough, mitigation, mitigCount) {
   const expDmg = d =>
     Object.entries(d).reduce((s, [k, p]) => s + +(k.split(',')[0]) * p, 0);
 
-  // The reroll pool is a single global resource shared across every attack, so
-  // availability is global — not gated on the firing weapon's own listed pool.
-  const poolExists = attackData.reduce((sum, r) => sum + (r.wpn.rerollPool || 0), 0) > 0;
+  // Strict per-weapon reroll pools: each weapon's pool is counted ONCE and is usable
+  // only by that weapon's own attacks (never shared across weapons, never scaled by
+  // the attack count). The DP carries a separate remaining count per pooled weapon,
+  // mixed-radix encoded into one integer `poolCode`. Dedup is by weapon-object
+  // identity (attacks sharing a weapon reference the same object).
+  const poolCapByWpn = new Map();
+  for (const r of attackData) {
+    const cap = r.wpn.rerollPool || 0;
+    if (cap > 0 && !poolCapByWpn.has(r.wpn)) poolCapByWpn.set(r.wpn, cap);
+  }
+  const poolStrideByWpn = new Map();
+  let R_POOL = 1;
+  for (const [wpn, cap] of poolCapByWpn) { poolStrideByWpn.set(wpn, R_POOL); R_POOL *= (cap + 1); }
+  const poolFull = R_POOL - 1;
 
   const rData = attackData.map(r => {
-    const hasPool    = poolExists;
-    const useCritPri = r.a.prioritizeCritRerolls && poolExists;
+    const aCap    = poolCapByWpn.get(r.wpn) || 0;
+    const aStride = poolStrideByWpn.get(r.wpn) || 0;
+    const aPooled = aCap > 0;
+    const useCritPri = r.a.prioritizeCritRerolls && aPooled;
     // Outcome sets are precomputed per attack (mixed over Caine POW growth and
     // Shatter) so the DP honours those effects instead of rebuilding from base POW.
     const ro = r.outNormal, kdRo = r.outKD, roBD = r.outBD, kdRoBD = r.outKDBD;
@@ -1002,7 +1019,7 @@ function computePKill(attackData, hp, tough, mitigation, mitigCount) {
       shredROBD = buildRerollOutcomes(sp.hp, sp.critP, r.wpn.pow, r.effArmBD, 2, 'none', false, [], []).r0;
     }
 
-    return { hasPool,
+    return { aCap, aStride, aPooled,
       r0:decodeOutcomes(ro.r0), r1:decodeOutcomes(effR1), r2:decodeOutcomes(effR2),
       r0KD:decodeOutcomes(kdRo.r0), r1KD:decodeOutcomes(kdRo.r1), r2KD:decodeOutcomes(kdRo.r2),
       r0BD:decodeOutcomes(roBD.r0), r1BD:decodeOutcomes(effR1BD), r2BD:decodeOutcomes(effR2BD),
@@ -1044,23 +1061,21 @@ function computePKill(attackData, hp, tough, mitigation, mitigCount) {
     const mi = ord.filter(i => isMelee(i)).sort(sortFn);
     ord = [...mi.slice(0, goTotal), ...ord.filter(i => !isMelee(i)), ...mi.slice(goTotal)];
   }
-  const totalPool = attackData.reduce((s, r) => s + (r.wpn.rerollPool || 0), 0);
-
   // Packed integer state keys (see Expo build notes): avoids per-entry string
   // alloc + split/parse in the hot DP loop. Packed max (~4.3e9) << MAX_SAFE_INTEGER.
-  const R_MIT = 32, R_KD = 2, R_RE = 128, R_SG = 32, R_BD = 2, R_GO = 32;
+  const R_MIT = 32, R_KD = 2, R_SG = 32, R_BD = 2, R_GO = 32;
   const packKey = (hpV, mit, kdV, re, sg, bdV, go) =>
-    ((((((hpV * R_MIT + mit) * R_KD + kdV) * R_RE + re) * R_SG + sg) * R_BD + bdV) * R_GO + go);
+    ((((((hpV * R_MIT + mit) * R_KD + kdV) * R_POOL + re) * R_SG + sg) * R_BD + bdV) * R_GO + go);
 
   let state = new Map();
-  state.set(packKey(hp, mitigCount, 0, totalPool, sgTotal, 0, goTotal), 1);
+  state.set(packKey(hp, mitigCount, 0, poolFull, sgTotal, 0, goTotal), 1);
   let pKill = 0;
 
   const rH = !!(tgt.rapidHealing);
   const denyToughByAtk = i => !!(attackData[i].wpn?.denyTough);
 
   for (const ai of ord) {
-    const { hasPool, r0, r1, r2, r0KD, r1KD, r2KD, r0BD, r1BD, r2BD, r0KDBD, r1KDBD, r2KDBD,
+    const { aCap, aStride, aPooled, r0, r1, r2, r0KD, r1KD, r2KD, r0BD, r1BD, r2BD, r0KDBD, r1KDBD, r2KDBD,
       hasShred, shredRO, shredROBD } = rData[ai];
     const next = new Map();
 
@@ -1078,7 +1093,7 @@ function computePKill(attackData, hp, tough, mitigation, mitigCount) {
     };
 
     // Resolve a Shred follow-up chain against a survivor (2d6/2d6, same weapon).
-    const resolveShred = (startHp, startMit, startSg, startGo, startBd, startKd, startRe, startProb, writeSurvivor) => {
+    const resolveShred = (startHp, startMit, startSg, startGo, startBd, startKd, startPoolCode, startProb, writeSurvivor) => {
       const packSub = (h, m, sg, go, b, k) =>
         (((((h * R_MIT + m) * R_SG + sg) * R_GO + go) * R_BD + b) * R_KD + k);
       let sub = new Map();
@@ -1142,27 +1157,29 @@ function computePKill(attackData, hp, tough, mitigation, mitigCount) {
       const goRem = kRem % R_GO; kRem = (kRem - goRem) / R_GO;
       const bd    = kRem % R_BD; kRem = (kRem - bd)    / R_BD;
       const sgRem = kRem % R_SG; kRem = (kRem - sgRem) / R_SG;
-      const reRem = kRem % R_RE; kRem = (kRem - reRem) / R_RE;
+      const poolCode = kRem % R_POOL; kRem = (kRem - poolCode) / R_POOL;
       const kd    = kRem % R_KD; kRem = (kRem - kd)    / R_KD;
       const mitRem= kRem % R_MIT;kRem = (kRem - mitRem)/ R_MIT;
       const hpRem = kRem;
       const ds = (kd&&bd)?{r0:r0KDBD,r1:r1KDBD,r2:r2KDBD}:(kd&&!bd)?{r0:r0KD,r1:r1KD,r2:r2KD}:(!kd&&bd)?{r0:r0BD,r1:r1BD,r2:r2BD}:{r0,r1,r2};
-      const ad = !hasPool || reRem === 0 ? ds.r0 : reRem === 1 ? ds.r1 : ds.r2;
+      const cnt = aPooled ? Math.floor(poolCode / aStride) % (aCap + 1) : 0;
+      const ad = !aPooled || cnt === 0 ? ds.r0 : cnt === 1 ? ds.r1 : ds.r2;
 
       for (let ti = 0; ti < ad.length; ti++) {
         const dmg = ad[ti][0], consumed = ad[ti][1], wasCrit = ad[ti][2], dcProb = ad[ti][3];
         const { effDmg, newMit, newSg, newGo } = mitigate(dmg, mitRem, sgRem, goRem);
         const newBd = (tgt.battleDriven && bd === 0 && effDmg > 0) ? 1 : bd;
         const newHp = hpRem - effDmg;
-        const newRe = Math.max(0, reRem - (hasPool ? consumed : 0));
+        const newCnt = aPooled ? Math.max(0, cnt - consumed) : 0;
+        const newPoolCode = aPooled ? poolCode + (newCnt - cnt) * aStride : poolCode;
         const tp    = sProb * dcProb;
 
         const writeSurvivor = (survHp, mit, sg, go, bdV, kdV, prob) => {
-          const nk = packKey(survHp, mit, kdV, newRe, sg, bdV, go);
+          const nk = packKey(survHp, mit, kdV, newPoolCode, sg, bdV, go);
           next.set(nk, (next.get(nk) || 0) + prob);
         };
         const onSurvivor = (survHp, prob, mit, kdV) => {
-          if (hasShred && wasCrit) resolveShred(survHp, mit, newSg, newGo, newBd, kdV, newRe, prob, writeSurvivor);
+          if (hasShred && wasCrit) resolveShred(survHp, mit, newSg, newGo, newBd, kdV, newPoolCode, prob, writeSurvivor);
           else writeSurvivor(survHp, mit, newSg, newGo, newBd, kdV, prob);
         };
 
@@ -1411,14 +1428,22 @@ function rebuildWeaponList() {
       <button onclick="weapons[${i}].autoDamage=(weapons[${i}].autoDamage&&weapons[${i}].autoDamage!=='off')?'off':'1';rebuildWeaponList();update();"
         style="${wpnBtnStyle(w.autoDamage&&w.autoDamage!=='off', '#8a5a1a', '#c4983a')}">Auto-Damage</button>
       ${(w.autoDamage&&w.autoDamage!=='off')?`<span style="display:inline-flex;align-items:center;gap:3px"><span style="font-size:10px;color:var(--text3)">Dmg</span><span class="seg" style="display:inline-flex">${['1','2','3','d3'].map(v=>`<button class="${w.autoDamage===v?'active':''}" style="${w.autoDamage===v?'background:#8a5a1a;color:#fff':''}" onclick="weapons[${i}].autoDamage='${v}';rebuildWeaponList();update();">${v}</button>`).join('')}</span></span>`:''}
-      <label style="font-size:10px;color:var(--text3);display:flex;align-items:center;gap:4px">
-        <span>Rerolls</span>
-        <select onchange="weapons[${i}].rerollPool=parseInt(this.value);renderAttacks();update();"
-          style="background:var(--bg);border:1px solid var(--bdr2);border-radius:6px;
-            color:${rerollColor};font-size:11px;padding:2px 5px">
-          ${rerollOptions}
-        </select>
-      </label>
+      <span style="display:inline-flex;align-items:center;gap:4px">
+        <label style="font-size:10px;color:var(--text3);display:flex;align-items:center;gap:4px">
+          <span>Rerolls</span>
+          <select onchange="weapons[${i}].rerollPool=parseInt(this.value);renderAttacks();update();"
+            style="background:var(--bg);border:1px solid var(--bdr2);border-radius:6px;
+              color:${rerollColor};font-size:11px;padding:2px 5px">
+            ${rerollOptions}
+          </select>
+        </label>
+        <button type="button" onclick="showRerollInfo()" title="How the reroll pool works"
+          aria-label="How the weapon reroll pool works"
+          style="background:transparent;border:1px solid var(--bdr2);color:var(--text3);
+            border-radius:50%;width:16px;height:16px;padding:0;font-size:11px;line-height:1;
+            cursor:pointer;font-family:inherit;display:inline-flex;align-items:center;
+            justify-content:center;flex-shrink:0;font-style:italic;font-weight:600">i</button>
+      </span>
       ${delBtn}
     </div>`;
   }).join('');
@@ -1487,11 +1512,11 @@ function addAttack() {
   const last = attacks[attacks.length - 1];
   attacks.push({
     stat: last?.stat || 7,
-    hitDice: 2, hitDrop: 'none', rerollMiss: false,
+    hitDice: 2, hitDrop: 'none', rerollMiss: false, stolenFate: false,
     wpnIdx: last?.wpnIdx || 0,
     dmgDice: 2, dmgDrop: 'none', rerollDmg: false,
     prioritizeCritRerolls: false,
-    hitAbs: [], critAbs: [], armDownValue: 1,
+    hitAbs: [], critAbs: [], armDownValue: 1, rofD3: false,
   });
   renderAttacks();
   update();
@@ -1574,6 +1599,13 @@ function toggleCollapseAll(){
   const allC=attacks.every((_,i)=>collapsedAttacks.has(i));
   if(allC)collapsedAttacks.clear();else attacks.forEach((_,i)=>collapsedAttacks.add(i));
   renderAttacks();
+  if(!allC){ // just collapsed all -> snap to the bottom-most attack, not the page bottom
+    requestAnimationFrame(()=>{
+      const list=document.getElementById('attack-list');
+      const last=list&&list.lastElementChild;
+      if(last)last.scrollIntoView({behavior:'smooth',block:'end'});
+    });
+  }
 }
 function updateCollapseBtn(){
   const allC=attacks.length>0&&attacks.every((_,i)=>collapsedAttacks.has(i));
@@ -1627,6 +1659,14 @@ function renderAttacks() {
       </span>
       <span class="toggle-label">Reroll miss</span>
     </label>`;
+    const stolenFateLabel = `<label class="toggle-row">
+      <span class="toggle">
+        <input type="checkbox" ${a.stolenFate ? 'checked' : ''}
+          onchange="attacks[${i}].stolenFate=this.checked;update()">
+        <span class="toggle-slider"></span>
+      </span>
+      <span class="toggle-label">Stolen Fate</span>
+    </label>`;
 
     // Crit-priority toggle (only shown when pool > 0 or rerollMiss is checked)
     const showCritPri = (wpn.rerollPool > 0) || a.rerollMiss;
@@ -1653,6 +1693,10 @@ function renderAttacks() {
       </span>
       <span class="toggle-label">Reroll damage</span>
     </label>`;
+    const rofStyle = a.rofD3
+      ? 'background:var(--blue);border:1px solid var(--blue);color:#fff'
+      : 'background:transparent;border:1px solid var(--bdr2);color:var(--text3)';
+    const rofBtn = `<button onclick="attacks[${i}].rofD3=!attacks[${i}].rofD3;renderAttacks();update()" title="ROF d3: this attack is made a d3 (1/2/3) number of times" style="${rofStyle};border-radius:6px;padding:3px 9px;font-size:11px;cursor:pointer;font-family:inherit;font-weight:600;white-space:nowrap">ROF D3</button>`;
 
     return `<div class="card" id="atk-card-${i}">
       <div class="card-hdr" style="border-left-color:${tc}">
@@ -1660,6 +1704,7 @@ function renderAttacks() {
         <span class="badge" style="background:${wpnC}">${aType[0].toUpperCase() + aType.slice(1)}</span>
         ${critDieBadge}${caineBadge}${hitBadges}${critBadges}
         ${wpnSelect}${delBtn}
+        ${rofBtn}
         <button class="collapse-btn" onclick="toggleCollapse(${i})">${collapsedAttacks.has(i)?'▶':'▼'}</button>
       </div>
       <div class="card-body${collapsedAttacks.has(i)?' collapsed':''}" style="display:${collapsedAttacks.has(i)?'none':'flex'};flex-direction:column;gap:8px">
@@ -1676,7 +1721,7 @@ function renderAttacks() {
             ${dropToggle(i, 'hitDrop', a.hitDrop)}
           </div>
         </div>
-        ${rerollMissLabel}${critPriToggle}
+        ${rerollMissLabel}${stolenFateLabel}${critPriToggle}
         <hr class="sep">
         <p class="section-lbl">DAMAGE</p>
         <div class="field-row">
@@ -1778,7 +1823,7 @@ function update() {
     let wHp = 0, wCritP = 0, srHp = 0, srCritP = 0;
     for (const [set, prob] of Object.entries(effState)) {
       if (prob < 1e-12) continue;
-      const { hp: h0, critP: cp0 } = hitProbsInSet(a.stat, getAttackEffDef(tgt.def, aType), a.hitDice, false, a.hitDrop, aType, set);
+      const { hp: h0, critP: cp0 } = hitProbsInSet(a.stat, getAttackEffDef(tgt.def, aType), a.hitDice, false, a.hitDrop, aType, set, a.stolenFate);
       srHp += prob * h0;
       srCritP += prob * cp0;
       const hN = 1 - Math.pow(1 - h0, dispAttempts);
@@ -1810,12 +1855,12 @@ function update() {
         let baseHp = 0, baseCritP = 0, autoHitProb = 0, autoHitCritContrib = 0;
         for (const [set, prob] of Object.entries(effState)) {
           if (prob < 1e-12) continue;
-          const { hp: h, critP: cp } = hitProbsInSet(a.stat, getAttackEffDef(tgt.def, aType), a.hitDice, false, a.hitDrop, aType, set);
+          const { hp: h, critP: cp } = hitProbsInSet(a.stat, getAttackEffDef(tgt.def, aType), a.hitDice, false, a.hitDrop, aType, set, a.stolenFate);
           if (h >= 1.0 - 1e-9) { autoHitProb += prob; autoHitCritContrib += prob * cp; }
           else { baseHp += prob * h; baseCritP += prob * cp; }
         }
         if (pSust > 0) {
-          autoHitProb += pSust; autoHitCritContrib += pSust * autoHitCritP;
+          autoHitProb += pSust;  // auto-hit (sustained) has no attack roll → no crit
           baseHp = (1 - pSust) * baseHp; baseCritP = (1 - pSust) * baseCritP;
         }
         // Apply crit-priority only to non-auto-hit portion; auto-hit always lands
@@ -1840,21 +1885,17 @@ function update() {
     // KD (knockdown) hit probs — used for kill DP tough saves
     const getKdProbs = () => {
       if (aType === 'melee') {
-        const n = Math.max(1, Math.min(5, a.hitDice));
-        const { critTotal, total } = getDropPrecomp(n, a.hitDrop);
-        return { hp: 1.0, critP: critTotal / total };
+        return { hp: 1.0, critP: 0 };  // KD melee auto-hit: no attack roll, no crit
       }
-      return hitProbs(a.stat, getAttackEffDef(Math.min(tgt.def, 5), aType), a.hitDice, a.rerollMiss, a.hitDrop);
+      return hitProbs(a.stat, getAttackEffDef(Math.min(tgt.def, 5), aType), a.hitDice, a.rerollMiss, a.hitDrop, a.stolenFate);
     };
     const { hp: kdHp, critP: kdCritP } = getKdProbs();
     // Single-roll KD probs (no per-attack reroll) for the kill-DP outcome sets.
     const getKdProbsSR = () => {
       if (aType === 'melee') {
-        const n = Math.max(1, Math.min(5, a.hitDice));
-        const { critTotal, total } = getDropPrecomp(n, a.hitDrop);
-        return { hp: 1.0, critP: critTotal / total };
+        return { hp: 1.0, critP: 0 };  // KD melee auto-hit: no attack roll, no crit
       }
-      return hitProbs(a.stat, getAttackEffDef(Math.min(tgt.def, 5), aType), a.hitDice, false, a.hitDrop);
+      return hitProbs(a.stat, getAttackEffDef(Math.min(tgt.def, 5), aType), a.hitDice, false, a.hitDrop, a.stolenFate);
     };
     const { hp: srKdHp, critP: srKdCritP } = getKdProbsSR();
     const atkEffDef = getAttackEffDef(tgt.def, aType);
@@ -1986,15 +2027,38 @@ function update() {
   });
 
   // Aggregate outcomes
-  const expHits  = results.reduce((s, r) => s + r.hp, 0);
-  const expTotal = results.reduce((s, r) => s + r.expDmg, 0);
-  const wMean    = expHits > 0 ? results.reduce((s, r) => s + r.hp * r.meanDmg, 0) / expHits : 0;
+  // ROF d3 profiles fire E[d3] = 2 attacks on average -> ~2x contribution to expected
+  // hits and expected total damage. (Per-attack pills still show single-attack figures.)
+  const rofMult = r => (r.a.rofD3 ? 2 : 1);
+  const expHits  = results.reduce((s, r) => s + rofMult(r) * r.hp, 0);
+  const expTotal = results.reduce((s, r) => s + rofMult(r) * r.expDmg, 0);
+  const wMean    = expHits > 0 ? results.reduce((s, r) => s + rofMult(r) * r.hp * r.meanDmg, 0) / expHits : 0;
   document.getElementById('out-hits').textContent  = expHits.toFixed(2);
   document.getElementById('out-avg').textContent   = wMean.toFixed(2);
   document.getElementById('out-total').textContent = expTotal.toFixed(2);
 
-  // Kill probability
-  const pKillBase = computePKill(results, tgt.hp, tgt.tough, 'none', 0);
+  // Kill probability — ROF d3: each enabled profile fires a d3 (1/2/3) number of
+  // times, rolling its OWN independent d3; kill prob is the average over all 3^k
+  // equally-likely combinations. Replicated entries share their weapon's fixed pool
+  // (computePKill dedups by weapon), so the pool never scales with the attack count.
+  const rofIdx = results.map((r, i) => (r.a.rofD3 ? i : -1)).filter(i => i >= 0);
+  const computePKillROF = (mit, mitCount) => {
+    if (rofIdx.length === 0) return computePKill(results, tgt.hp, tgt.tough, mit, mitCount);
+    const denom = Math.pow(3, rofIdx.length);
+    let total = 0;
+    for (let code = 0; code < denom; code++) {
+      let c = code; const mult = [];
+      for (let j = 0; j < rofIdx.length; j++) { mult.push((c % 3) + 1); c = Math.floor(c / 3); }
+      const expanded = [];
+      for (let i = 0; i < results.length; i++) {
+        const ri = rofIdx.indexOf(i); const reps = ri >= 0 ? mult[ri] : 1;
+        for (let q = 0; q < reps; q++) expanded.push(results[i]);
+      }
+      total += computePKill(expanded, tgt.hp, tgt.tough, mit, mitCount);
+    }
+    return total / denom;
+  };
+  const pKillBase = computePKillROF('none', 0);
   document.getElementById('kill-base-pct').textContent = (pKillBase * 100).toFixed(2) + '%';
   document.getElementById('kill-base-bar').style.width = (pKillBase * 100).toFixed(2) + '%';
   const toughLabel = tgt.tough !== 'none'
@@ -2004,7 +2068,7 @@ function update() {
 
   const mitRow = document.getElementById('kill-mit-row');
   if (tgt.mitigation !== 'none') {
-    const pMit      = computePKill(results, tgt.hp, tgt.tough, tgt.mitigation, tgt.mitigCount);
+    const pMit      = computePKillROF(tgt.mitigation, tgt.mitigCount);
     const mitColor  = tgt.mitigation === 'overboost' ? 'var(--over)' : 'var(--trans)';
     const mitLabel  = tgt.mitigation === 'overboost'
       ? `Overboost (${tgt.mitigCount} focus)`
@@ -2140,6 +2204,48 @@ refreshSegs();
 
 </script>
 
+<!-- ── Reroll pool info modal ── -->
+<div id="reroll-overlay"
+  onclick="if(event.target===this)hideRerollInfo()"
+  style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.6);
+         z-index:200;align-items:flex-end;justify-content:center">
+  <div role="dialog" aria-modal="true" aria-label="Weapon reroll pool"
+    style="background:var(--bg2);border:0.5px solid var(--bdr2);
+           border-radius:20px 20px 0 0;width:100%;max-width:560px;
+           max-height:70vh;display:flex;flex-direction:column;
+           padding-bottom:env(safe-area-inset-bottom,16px)">
+    <div style="padding:20px 20px 14px;border-bottom:0.5px solid var(--bdr);
+                display:flex;flex-direction:column;align-items:center;gap:4px">
+      <p style="margin:0;font-size:18px;font-weight:600;color:var(--text)">Weapon Reroll Pool</p>
+    </div>
+    <div style="padding:16px 20px;overflow-y:auto;flex:1">
+      <p style="margin:0 0 10px;font-size:13px;color:var(--text2);line-height:1.6">
+        Each weapon has its own pool of rerolls, set with this control. The pool is shared
+        across every attack made with that weapon &mdash; including the extra attacks generated
+        by ROF&nbsp;d3 &mdash; and never grows with the number of attacks.
+      </p>
+      <p style="margin:0 0 10px;font-size:13px;color:var(--text2);line-height:1.6">
+        Rerolls are spent automatically where they help most: first to reroll missed attack
+        rolls, then to improve low damage rolls. Each roll can be rerolled at most once (up to
+        one on the attack roll and one on the damage roll per attack), and the new result is
+        always kept &mdash; rerolls are forced, not best-of-two.
+      </p>
+      <p style="margin:0;font-size:13px;color:var(--text2);line-height:1.6">
+        Pools are strictly per-weapon: one weapon's rerolls can never be used by another
+        weapon's attacks. Two weapons that each have a pool are tracked separately.
+      </p>
+    </div>
+    <div style="padding:12px 16px 16px">
+      <button onclick="hideRerollInfo()"
+        style="width:100%;background:var(--bg3);border:0.5px solid var(--bdr2);
+               border-radius:10px;padding:12px;color:var(--text);
+               font-size:15px;font-weight:500;cursor:pointer;font-family:inherit">
+        Done
+      </button>
+    </div>
+  </div>
+</div>
+
 <!-- ── About modal ── -->
 <div id="about-overlay"
   onclick="if(event.target===this)closeAbout()"
@@ -2219,7 +2325,7 @@ document.addEventListener('click', function(e) {
 });
 // Close menu on Escape
 document.addEventListener('keydown', function(e) {
-  if (e.key === 'Escape') { closeMenu(); closeAbout(); }
+  if (e.key === 'Escape') { closeMenu(); closeAbout(); hideRerollInfo(); }
 });
 function openAbout() {
   closeMenu();
@@ -2229,6 +2335,14 @@ function openAbout() {
 }
 function closeAbout() {
   document.getElementById('about-overlay').style.display = 'none';
+  document.body.style.overflow = '';
+}
+function showRerollInfo() {
+  document.getElementById('reroll-overlay').style.display = 'flex';
+  document.body.style.overflow = 'hidden';
+}
+function hideRerollInfo() {
+  document.getElementById('reroll-overlay').style.display = 'none';
   document.body.style.overflow = '';
 }
 </script>
