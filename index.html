@@ -425,7 +425,7 @@ let tgt = {
   preStationary: false,
   unyielding: false, deceleration: false, battleDriven: false,
   forceBarrier: false, duelist: false, kineticField: false,
-  carapace: false, rapidHealing: false,
+  carapace: false, rapidHealing: false, imperviousFlesh: false,
   prioritizePreventingStatus: false,
 };
 
@@ -1359,6 +1359,7 @@ const TARGET_ABILITIES=[
   {key:'kineticField',label:'Kinetic Field',note:'+2 ARM vs ranged',                         color:'#6a2a5a'},
   {key:'carapace',    label:'Carapace',      note:'+4 ARM vs ranged',                         color:'#3a5a2a'},
   {key:'rapidHealing',  label:'Rapid Healing', note:'Recover d3 HP after each damaging hit (capped at starting HP)', color:'#2a7a4a'},
+  {key:'imperviousFlesh',label:'Impervious Flesh',note:'−1 damage die on all damage rolls',                       color:'#4a5a6a'},
 ];
 function renderTargetAbilities(){
   const el=document.getElementById('target-abilities'), notes=document.getElementById('target-ability-notes');
@@ -1797,7 +1798,8 @@ function update() {
   const caineState = {};
   weapons.forEach((w, i) => { if (w.caineFeat) caineState[i] = { 0: 1 }; });
 
-  const results = attacks.map(a => {
+  const results = attacks.map(aRaw => {
+    const a = tgt.imperviousFlesh ? { ...aRaw, dmgDice: Math.max(1, aRaw.dmgDice - 1) } : aRaw;
     const wpn = weapons[Math.min(a.wpnIdx, weapons.length - 1)] || weapons[0];
     const aType = wpn.attackType || 'melee';
     const wAuto = wpn.autoDamage || 'off';
@@ -2176,7 +2178,7 @@ function resetAll() {
     preStationary: false,
     unyielding: false, deceleration: false, battleDriven: false,
     forceBarrier: false, duelist: false, kineticField: false,
-    carapace: false, rapidHealing: false,
+    carapace: false, rapidHealing: false, imperviousFlesh: false,
     prioritizePreventingStatus: false,
   };
   document.getElementById('tgt-def').value = 14;
