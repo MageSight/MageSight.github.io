@@ -330,8 +330,16 @@ input[type=number]::-webkit-inner-spin-button{-webkit-appearance:none;margin:0;}
       <div class="metric-value" style="color:var(--purple)" id="out-avg">—</div>
     </div>
     <div class="metric">
-      <div class="metric-label">Expected Total</div>
-      <div class="metric-value" style="color:var(--green)" id="out-total">—</div>
+      <div class="metric-label">Expected Damage Dealt</div>
+      <div class="metric-value" style="color:var(--red)" id="out-total">—</div>
+    </div>
+    <div class="metric">
+      <div class="metric-label">Any Crit</div>
+      <div class="metric-value" style="color:var(--orange)" id="out-anycrit">—</div>
+    </div>
+    <div class="metric" id="metric-healed" style="display:none">
+      <div class="metric-label">Expected Healed</div>
+      <div class="metric-value" style="color:#2a7a4a" id="out-healed">—</div>
     </div>
   </div>
 
@@ -964,6 +972,10 @@ function buildOutcomeSet(ctx) {
 const SHRED_EPSILON = 1e-7;
 const SHRED_MAX_DEPTH = 64;
 
+// Expected HP restored by Rapid Healing across the whole sequence. Accumulated by the
+// kill DP and read by the caller immediately after computePKill/computePKillROF returns.
+let LAST_EXP_HEALED = 0;
+
 // Decode an outcome map (keyed "dmg,consumed,crit") into [dmg,consumed,crit,prob]
 // tuples once, so the DP need not re-parse the string key on every state visit.
 function decodeOutcomes(m) {
@@ -976,7 +988,7 @@ function decodeOutcomes(m) {
 }
 
 function computePKill(attackData, hp, tough, mitigation, mitigCount) {
-  if (hp <= 0) return 1;
+  if (hp <= 0) { LAST_EXP_HEALED = 0; return 1; }
 
   const expDmg = d =>
     Object.entries(d).reduce((s, [k, p]) => s + +(k.split(',')[0]) * p, 0);
@@ -1070,6 +1082,7 @@ function computePKill(attackData, hp, tough, mitigation, mitigCount) {
   let state = new Map();
   state.set(packKey(hp, mitigCount, 0, poolFull, sgTotal, 0, goTotal), 1);
   let pKill = 0;
+  let expHealed = 0;
 
   const rH = !!(tgt.rapidHealing);
   const denyToughByAtk = i => !!(attackData[i].wpn?.denyTough);
@@ -1084,12 +1097,14 @@ function computePKill(attackData, hp, tough, mitigation, mitigCount) {
 
     // Apply one damage value through the target's mitigations.
     const mitigate = (dmg, mitRem, sgRem, goRem) => {
-      let effDmg = dmg, newMit = mitRem, newSg = sgRem, newGo = goRem;
+      let effDmg = dmg, newMit = mitRem, newSg = sgRem, newGo = goRem, transferred = false;
       if (isRangedAtk && dmg > 0 && newSg > 0) { effDmg = 0; newSg--; }
       else if (isMeleeAtk && dmg > 0 && newGo > 0) { effDmg = 0; newGo--; }
       else if (mitigation === 'overboost' && dmg > 0 && newMit > 0) { effDmg = Math.max(0, dmg - 5); newMit--; }
-      else if (mitigation === 'transfer' && dmg > 0 && newMit > 0) { effDmg = 0; newMit--; }
-      return { effDmg, newMit, newSg, newGo };
+      // Transferred damage is still damage suffered by the target's warbeast on the
+      // target's behalf: it triggers Rapid Healing even though the target loses 0 HP.
+      else if (mitigation === 'transfer' && dmg > 0 && newMit > 0) { effDmg = 0; newMit--; transferred = true; }
+      return { effDmg, newMit, newSg, newGo, transferred };
     };
 
     // Resolve a Shred follow-up chain against a survivor (2d6/2d6, same weapon).
@@ -1112,7 +1127,8 @@ function computePKill(attackData, hp, tough, mitigation, mitigCount) {
           const ro = sbd ? shredROBD : shredRO;
           for (let ti = 0; ti < ro.length; ti++) {
             const dmg = ro[ti][0], wasCrit = ro[ti][2], dcProb = ro[ti][3];
-            const { effDmg, newMit, newSg, newGo } = mitigate(dmg, smit, ssg, sgo);
+            const { effDmg, newMit, newSg, newGo, transferred } = mitigate(dmg, smit, ssg, sgo);
+            const healTrig = effDmg > 0 || transferred;
             const newBd = (tgt.battleDriven && sbd === 0 && effDmg > 0) ? 1 : sbd;
             const nHp = shp - effDmg, prob = sp * dcProb;
             if (prob <= 0) continue;
@@ -1128,12 +1144,12 @@ function computePKill(attackData, hp, tough, mitigation, mitigCount) {
               if (tough !== 'none' && !denyToughByAtk(ai) && skd === 0) {
                 // Survive on a 5-6 (2/6); plain Tough knocks down, Tough/Steady stays standing.
                 const toughKd = tough === 'tough' ? 1 : skd;
-                if (rH && effDmg > 0) { for (const h2 of [1,2,3]) settle(Math.min(hp, 1 + h2), prob * TOUGH_SAVE_PROB / 3, newMit, toughKd); }
+                if (rH && healTrig) { for (const h2 of [1,2,3]) { expHealed += (prob * TOUGH_SAVE_PROB / 3) * (Math.min(hp, 1 + h2) - 1); settle(Math.min(hp, 1 + h2), prob * TOUGH_SAVE_PROB / 3, newMit, toughKd); } }
                 else settle(1, prob * TOUGH_SAVE_PROB, newMit, toughKd);
                 pKill += prob * (1 - TOUGH_SAVE_PROB);
               } else pKill += prob;
             } else {
-              if (rH && effDmg > 0) { for (const h2 of [1,2,3]) settle(Math.min(hp, nHp + h2), prob / 3, newMit); }
+              if (rH && healTrig) { for (const h2 of [1,2,3]) { expHealed += (prob / 3) * (Math.min(hp, nHp + h2) - nHp); settle(Math.min(hp, nHp + h2), prob / 3, newMit); } }
               else settle(nHp, prob, newMit);
             }
           }
@@ -1167,7 +1183,8 @@ function computePKill(attackData, hp, tough, mitigation, mitigCount) {
 
       for (let ti = 0; ti < ad.length; ti++) {
         const dmg = ad[ti][0], consumed = ad[ti][1], wasCrit = ad[ti][2], dcProb = ad[ti][3];
-        const { effDmg, newMit, newSg, newGo } = mitigate(dmg, mitRem, sgRem, goRem);
+        const { effDmg, newMit, newSg, newGo, transferred } = mitigate(dmg, mitRem, sgRem, goRem);
+        const healTrig = effDmg > 0 || transferred;
         const newBd = (tgt.battleDriven && bd === 0 && effDmg > 0) ? 1 : bd;
         const newHp = hpRem - effDmg;
         const newCnt = aPooled ? Math.max(0, cnt - consumed) : 0;
@@ -1189,20 +1206,21 @@ function computePKill(attackData, hp, tough, mitigation, mitigCount) {
             // A knocked-down model cannot Tough; Tough/Steady is never knocked down
             // so it can keep making Tough checks.
             const newKd = tough === 'tough' ? 1 : kd;
-            if (rH && effDmg > 0) { for (const h2 of [1,2,3]) onSurvivor(Math.min(hp, 1 + h2), tp * TOUGH_SAVE_PROB / 3, newMit, newKd); }
+            if (rH && healTrig) { for (const h2 of [1,2,3]) { expHealed += (tp * TOUGH_SAVE_PROB / 3) * (Math.min(hp, 1 + h2) - 1); onSurvivor(Math.min(hp, 1 + h2), tp * TOUGH_SAVE_PROB / 3, newMit, newKd); } }
             else onSurvivor(1, tp * TOUGH_SAVE_PROB, newMit, newKd);
             pKill += tp * (1 - TOUGH_SAVE_PROB);
           } else {
             pKill += tp;
           }
         } else {
-          if (rH && effDmg > 0) { for (const h2 of [1,2,3]) onSurvivor(Math.min(hp, newHp + h2), tp / 3, newMit, kd); }
+          if (rH && healTrig) { for (const h2 of [1,2,3]) { expHealed += (tp / 3) * (Math.min(hp, newHp + h2) - newHp); onSurvivor(Math.min(hp, newHp + h2), tp / 3, newMit, kd); } }
           else onSurvivor(newHp, tp, newMit, kd);
         }
       }
     }
     state = next;
   }
+  LAST_EXP_HEALED = expHealed;
   return pKill;
 }
 
@@ -1655,7 +1673,7 @@ function renderAttacks() {
     const rerollMissLabel = `<label class="toggle-row">
       <span class="toggle">
         <input type="checkbox" ${a.rerollMiss ? 'checked' : ''}
-          onchange="attacks[${i}].rerollMiss=this.checked;update()">
+          onchange="attacks[${i}].rerollMiss=this.checked;renderAttacks();update()">
         <span class="toggle-slider"></span>
       </span>
       <span class="toggle-label">Reroll miss</span>
@@ -1820,7 +1838,7 @@ function update() {
     // single-roll hit prob h0 the chance after `attempts` tries is 1-(1-h0)^attempts, and
     // crit scales as critP0 * hit/h0. srHp/srCritP stay SINGLE-ROLL and feed the kill-DP
     // outcome sets, which model the per-attack reroll and shared-pool depletion exactly.
-    const poolForDisplay = weapons.some(w => (w.rerollPool || 0) > 0) ? 1 : 0;
+    const poolForDisplay = (wpn.rerollPool || 0) > 0 ? 1 : 0;
     const dispAttempts = 1 + (a.rerollMiss ? 1 : 0) + poolForDisplay;
     let wHp = 0, wCritP = 0, srHp = 0, srCritP = 0;
     for (const [set, prob] of Object.entries(effState)) {
@@ -2035,9 +2053,18 @@ function update() {
   const expHits  = results.reduce((s, r) => s + rofMult(r) * r.hp, 0);
   const expTotal = results.reduce((s, r) => s + rofMult(r) * r.expDmg, 0);
   const wMean    = expHits > 0 ? results.reduce((s, r) => s + rofMult(r) * r.hp * r.meanDmg, 0) / expHits : 0;
+  // P(at least one crit). Attacks are independent; a ROF d3 profile fires m in {1,2,3}
+  // with equal probability, so its no-crit factor is the mean of (1-c)^m over m -- the
+  // same averaging the kill DP applies over ROF combinations.
+  const pNoCrit = results.reduce((s, r) => {
+    const q = Math.max(0, 1 - r.critP);
+    return s * (r.a.rofD3 ? (q + q * q + q * q * q) / 3 : q);
+  }, 1);
+  const pAnyCrit = 1 - pNoCrit;
   document.getElementById('out-hits').textContent  = expHits.toFixed(2);
   document.getElementById('out-avg').textContent   = wMean.toFixed(2);
   document.getElementById('out-total').textContent = expTotal.toFixed(2);
+  document.getElementById('out-anycrit').textContent = (pAnyCrit * 100).toFixed(1) + '%';
 
   // Kill probability — ROF d3: each enabled profile fires a d3 (1/2/3) number of
   // times, rolling its OWN independent d3; kill prob is the average over all 3^k
@@ -2047,7 +2074,7 @@ function update() {
   const computePKillROF = (mit, mitCount) => {
     if (rofIdx.length === 0) return computePKill(results, tgt.hp, tgt.tough, mit, mitCount);
     const denom = Math.pow(3, rofIdx.length);
-    let total = 0;
+    let total = 0, healTotal = 0;
     for (let code = 0; code < denom; code++) {
       let c = code; const mult = [];
       for (let j = 0; j < rofIdx.length; j++) { mult.push((c % 3) + 1); c = Math.floor(c / 3); }
@@ -2057,10 +2084,14 @@ function update() {
         for (let q = 0; q < reps; q++) expanded.push(results[i]);
       }
       total += computePKill(expanded, tgt.hp, tgt.tough, mit, mitCount);
+      healTotal += LAST_EXP_HEALED;
     }
+    LAST_EXP_HEALED = healTotal / denom;
     return total / denom;
   };
   const pKillBase = computePKillROF('none', 0);
+  // Report healing for the target's ACTUAL configuration (mitigation included when set).
+  let expHealedShown = LAST_EXP_HEALED;
   document.getElementById('kill-base-pct').textContent = (pKillBase * 100).toFixed(2) + '%';
   document.getElementById('kill-base-bar').style.width = (pKillBase * 100).toFixed(2) + '%';
   const toughLabel = tgt.tough !== 'none'
@@ -2071,6 +2102,7 @@ function update() {
   const mitRow = document.getElementById('kill-mit-row');
   if (tgt.mitigation !== 'none') {
     const pMit      = computePKillROF(tgt.mitigation, tgt.mitigCount);
+    expHealedShown = LAST_EXP_HEALED;
     const mitColor  = tgt.mitigation === 'overboost' ? 'var(--over)' : 'var(--trans)';
     const mitLabel  = tgt.mitigation === 'overboost'
       ? `Overboost (${tgt.mitigCount} focus)`
@@ -2083,6 +2115,17 @@ function update() {
     mitRow.style.display = 'flex';
   } else {
     mitRow.style.display = 'none';
+  }
+
+  // Expected damage healed (Rapid Healing only)
+  const healedCard = document.getElementById('metric-healed');
+  if (healedCard) {
+    if (tgt.rapidHealing) {
+      healedCard.style.display = '';
+      document.getElementById('out-healed').textContent = expHealedShown.toFixed(2);
+    } else {
+      healedCard.style.display = 'none';
+    }
   }
 
   // Header status badges reflect the live Target settings (hidden when inactive).
@@ -2261,7 +2304,7 @@ refreshSegs();
     <div style="padding:20px 20px 14px;border-bottom:0.5px solid var(--bdr);
                 display:flex;flex-direction:column;align-items:center;gap:4px">
       <p style="margin:0;font-size:18px;font-weight:600;color:var(--text)">Mage Sight</p>
-      <p style="margin:0;font-size:11px;color:var(--text3)">Version 1.0.0</p>
+      <p style="margin:0;font-size:11px;color:var(--text3)">Version 1.1.0</p>
     </div>
     <div style="padding:16px 20px;overflow-y:auto;flex:1">
       <p style="margin:0 0 10px;font-size:13px;color:var(--text2);line-height:1.6">

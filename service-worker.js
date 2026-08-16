@@ -5,7 +5,7 @@
  * to fetch. Once installed, the app runs fully offline indefinitely.
  * Bump CACHE_VERSION whenever index.html changes to push an update to installs.
  */
-const CACHE_VERSION = 'mage-sight-v1.0.0';
+const CACHE_VERSION = 'mage-sight-v1.1.0';
 const APP_SHELL = [
   './',
   './index.html',
